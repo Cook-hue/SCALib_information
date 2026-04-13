@@ -16,3 +16,4 @@ src/scalib/build_config.py
 .cargo_build*
 paper/paper.pdf
 paper/paper.jats
+.venv/
