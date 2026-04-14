@@ -2,7 +2,7 @@ import numpy as np
 import time
 from scalib.modeling import RLDAClassifier
 
-NB = 25
+NB = 32
 NS = 3
 P = 3
 NV = 1

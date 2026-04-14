@@ -109,6 +109,7 @@ fn fast_exp(x: f64) -> f64 {
     // Use the identity: exp(x) = 2^(x * log2(e))
     // Then exploit the IEEE754 float layout to compute 2^n cheaply
     let t = x * 1.4426950408889634; // x * log2(e)
+    let s = (1u64 << 52) as f64;
     let w = t.floor();
     let r = t - w;
     // Polynomial approximation of 2^r for r in [0,1]
@@ -383,7 +384,8 @@ impl RLDA {
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
-            .for_each(|res, trace, &label| {
+            .into_par_iter()
+            .for_each(|(res, trace, &label)| {
                 // Extract trace as raw slice — avoids ndarray indexing in j loop
                 let trace_raw = trace.as_slice().expect("trace must be contiguous");
                 let mut max_score = f64::NEG_INFINITY;
