@@ -2,7 +2,7 @@ import numpy as np
 import time
 from scalib.modeling import RLDAClassifier
 
-NB = 20
+NB = 25
 NS = 3
 P = 3
 NV = 1
@@ -47,10 +47,11 @@ times = []
 for _ in range(N_REPEATS):
     t0 = time.perf_counter()
     # your get_info call goes here
-    rlda.get_info(eval_traces, eval_labels, 0)
+    info = rlda.get_info(eval_traces, eval_labels, 0)
     t1 = time.perf_counter()
     times.append(t1 - t0)
 
+print(f"Obtained information {info} \n")
 print(
     f"mean: {np.mean(times):.3f}s  std: {np.std(times):.3f}s  min: {np.min(times):.3f}s"
 )

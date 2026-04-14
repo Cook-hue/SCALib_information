@@ -347,67 +347,78 @@ impl RLDA {
 
         let nt = x.len_of(Axis(0));
         let mut result = Array1::<f64>::zeros(nt);
-
         let n_chunks = (self.nb + NBITS_CHUNK - 1) / NBITS_CHUNK;
+        let n_outer = (1usize << self.nb) / SIZE_CHUNK;
+
+        // Pre-extract mu_chunks slice for variable v — avoids repeated nv indexing
+        // inside the hot loop. Shape: (n_chunks, SIZE_CHUNK, p)
+        let mu = self.mu_chunks.slice(s![v, .., .., ..]);
 
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
             .for_each(|res, trace, &label| {
-                // Compute scores for all 2^nb classes using chunk structure
-                // and track max on the fly
                 let mut max_score = f64::NEG_INFINITY;
-                let mut scores = vec![0.0f64; 1 << self.nb];
 
-                let calculate_sqdist =
-                    |chunk_index: usize, scores_chunk: &mut [f64], tmp_mu: &mut Vec<f64>| {
-                        // Build tmp_mu: trace minus all MSB chunks
+                // ── pass 1: find max score over all 2^nb classes ──────────────
+                for chunk_index in 0..n_outer {
+                    let mut tmp_mu = [0.0f64; 3]; // stack allocated, p<=3
+                    for j in 0..self.p {
+                        tmp_mu[j] = trace[[j]];
+                        for chunk in 0..(n_chunks - 1) {
+                            let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
+                            tmp_mu[j] -= mu[[chunk + 1, i_chunk, j]];
+                        }
+                    }
+                    for i_lsb in 0..SIZE_CHUNK {
+                        let mut sq = 0.0f64;
                         for j in 0..self.p {
-                            tmp_mu[j] = trace[[j]];
-                            for chunk in 0..(n_chunks - 1) {
-                                let i_chunk =
-                                    (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
-                                tmp_mu[j] -= self.mu_chunks[[v, chunk + 1, i_chunk, j]];
-                            }
+                            let acc = tmp_mu[j] - mu[[0, i_lsb, j]];
+                            sq += acc * acc;
                         }
-                        // Inner LSB loop
-                        for i_lsb in 0..std::cmp::min(SIZE_CHUNK, 1 << self.nb) {
-                            let mut sq = 0.0f64;
-                            for j in 0..self.p {
-                                let acc = tmp_mu[j] - self.mu_chunks[[v, 0, i_lsb, j]];
-                                sq += acc * acc;
-                            }
-                            scores_chunk[i_lsb] = -0.5 * sq;
+                        let score = -0.5 * sq;
+                        if score > max_score {
+                            max_score = score;
                         }
-                    };
-
-                // Fill scores using chunk split — same as predict_proba
-                if self.nb < NBITS_CHUNK {
-                    let mut tmp_mu = vec![0.0f64; self.p];
-                    calculate_sqdist(0, &mut scores[..], &mut tmp_mu);
-                } else {
-                    let n_outer = (1usize << self.nb) / SIZE_CHUNK;
-                    let mut tmp_mu = vec![0.0f64; self.p];
-                    for chunk_index in 0..n_outer {
-                        let base = chunk_index * SIZE_CHUNK;
-                        calculate_sqdist(
-                            chunk_index,
-                            &mut scores[base..base + SIZE_CHUNK],
-                            &mut tmp_mu,
-                        );
                     }
                 }
 
-                // Find max
-                for &s in scores.iter() {
-                    if s > max_score {
-                        max_score = s;
+                // ── pass 2: accumulate exp(score - max) ───────────────────────
+                let mut exp_sum = 0.0f64;
+                for chunk_index in 0..n_outer {
+                    let mut tmp_mu = [0.0f64; 3];
+                    for j in 0..self.p {
+                        tmp_mu[j] = trace[[j]];
+                        for chunk in 0..(n_chunks - 1) {
+                            let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
+                            tmp_mu[j] -= mu[[chunk + 1, i_chunk, j]];
+                        }
+                    }
+                    for i_lsb in 0..SIZE_CHUNK {
+                        let mut sq = 0.0f64;
+                        for j in 0..self.p {
+                            let acc = tmp_mu[j] - mu[[0, i_lsb, j]];
+                            sq += acc * acc;
+                        }
+                        exp_sum += (-0.5 * sq - max_score).exp();
                     }
                 }
 
-                // Compute log2_softmax_i
-                let exp_sum: f64 = scores.iter().map(|&s| (s - max_score).exp()).sum();
-                let correct_score = scores[label as usize & ((1 << self.nb) - 1)];
+                // ── numerator: score of correct class only ────────────────────
+                let correct_score = {
+                    let mut sq = 0.0f64;
+                    for j in 0..self.p {
+                        let mut mu_j = 0.0f64;
+                        for chunk in 0..n_chunks {
+                            let byte = ((label >> (chunk * NBITS_CHUNK)) & 0xFF) as usize;
+                            mu_j += mu[[chunk, byte, j]];
+                        }
+                        let diff = trace[[j]] - mu_j;
+                        sq += diff * diff;
+                    }
+                    -0.5 * sq
+                };
+
                 *res = (correct_score - max_score) * LOG2_E - exp_sum.log2();
             });
 
