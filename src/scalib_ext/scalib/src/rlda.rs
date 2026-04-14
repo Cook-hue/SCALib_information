@@ -340,7 +340,6 @@ impl RLDA {
     pub fn get_info(&self, x: ArrayView2<i16>, labels: ArrayView1<u64>, v: usize) -> Array1<f64> {
         use std::f64::consts::LOG2_E;
 
-        // Project traces: shape (nt, p)
         let x = x
             .mapv(|x| x as f64)
             .dot(&self.norm_proj.slice(s![v, .., ..]).t());
@@ -350,30 +349,40 @@ impl RLDA {
         let n_chunks = (self.nb + NBITS_CHUNK - 1) / NBITS_CHUNK;
         let n_outer = (1usize << self.nb) / SIZE_CHUNK;
 
-        // Pre-extract mu_chunks slice for variable v — avoids repeated nv indexing
-        // inside the hot loop. Shape: (n_chunks, SIZE_CHUNK, p)
+        // Pre-extract mu_chunks as a flat slice — shape (n_chunks, SIZE_CHUNK, p)
+        // Layout is C-contiguous: mu[chunk, byte, j] = raw[chunk * SIZE_CHUNK * p + byte * p + j]
         let mu = self.mu_chunks.slice(s![v, .., .., ..]);
+        let mu_raw = mu.as_slice().expect("mu_chunks must be contiguous");
+        let p = self.p;
+
+        // Helper: access mu[chunk, byte, j] from raw slice
+        // avoids all ndarray stride arithmetic in the hot loop
+        let mu_get = |chunk: usize, byte: usize, j: usize| -> f64 {
+            mu_raw[chunk * SIZE_CHUNK * p + byte * p + j]
+        };
 
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
             .for_each(|res, trace, &label| {
+                // Extract trace as raw slice — avoids ndarray indexing in j loop
+                let trace_raw = trace.as_slice().expect("trace must be contiguous");
                 let mut max_score = f64::NEG_INFINITY;
 
-                // ── pass 1: find max score over all 2^nb classes ──────────────
+                // ── pass 1: find max ──────────────────────────────────────────
                 for chunk_index in 0..n_outer {
-                    let mut tmp_mu = [0.0f64; 3]; // stack allocated, p<=3
-                    for j in 0..self.p {
-                        tmp_mu[j] = trace[[j]];
+                    let mut tmp_mu = [0.0f64; 3];
+                    for j in 0..p {
+                        tmp_mu[j] = trace_raw[j];
                         for chunk in 0..(n_chunks - 1) {
                             let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
-                            tmp_mu[j] -= mu[[chunk + 1, i_chunk, j]];
+                            tmp_mu[j] -= mu_get(chunk + 1, i_chunk, j);
                         }
                     }
                     for i_lsb in 0..SIZE_CHUNK {
                         let mut sq = 0.0f64;
-                        for j in 0..self.p {
-                            let acc = tmp_mu[j] - mu[[0, i_lsb, j]];
+                        for j in 0..p {
+                            let acc = tmp_mu[j] - mu_get(0, i_lsb, j);
                             sq += acc * acc;
                         }
                         let score = -0.5 * sq;
@@ -387,33 +396,33 @@ impl RLDA {
                 let mut exp_sum = 0.0f64;
                 for chunk_index in 0..n_outer {
                     let mut tmp_mu = [0.0f64; 3];
-                    for j in 0..self.p {
-                        tmp_mu[j] = trace[[j]];
+                    for j in 0..p {
+                        tmp_mu[j] = trace_raw[j];
                         for chunk in 0..(n_chunks - 1) {
                             let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
-                            tmp_mu[j] -= mu[[chunk + 1, i_chunk, j]];
+                            tmp_mu[j] -= mu_get(chunk + 1, i_chunk, j);
                         }
                     }
                     for i_lsb in 0..SIZE_CHUNK {
                         let mut sq = 0.0f64;
-                        for j in 0..self.p {
-                            let acc = tmp_mu[j] - mu[[0, i_lsb, j]];
+                        for j in 0..p {
+                            let acc = tmp_mu[j] - mu_get(0, i_lsb, j);
                             sq += acc * acc;
                         }
                         exp_sum += (-0.5 * sq - max_score).exp();
                     }
                 }
 
-                // ── numerator: score of correct class only ────────────────────
+                // ── correct class score ───────────────────────────────────────
                 let correct_score = {
                     let mut sq = 0.0f64;
-                    for j in 0..self.p {
+                    for j in 0..p {
                         let mut mu_j = 0.0f64;
                         for chunk in 0..n_chunks {
                             let byte = ((label >> (chunk * NBITS_CHUNK)) & 0xFF) as usize;
-                            mu_j += mu[[chunk, byte, j]];
+                            mu_j += mu_get(chunk, byte, j);
                         }
-                        let diff = trace[[j]] - mu_j;
+                        let diff = trace_raw[j] - mu_j;
                         sq += diff * diff;
                     }
                     -0.5 * sq
