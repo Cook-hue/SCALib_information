@@ -1,0 +1,16 @@
+iniconfig==2.3.0
+maturin==1.13.1
+numpy==2.4.4
+packaging==26.0
+pluggy==1.6.0
+Pygments==2.20.0
+pytest==9.0.3
+-e git+ssh://git@github.com/Cook-hue/SCALib_information.git@6870630b305992cb5098cd74fd22d27950662b54#egg=scalib
+scipy==1.17.1
+semantic-version==2.10.0
+setuptools==82.0.1
+setuptools-rust==1.12.1
+setuptools-scm==10.0.5
+setuptools-scm-git-archive==1.4.1
+vcs-versioning==1.1.1
+wheel==0.46.3
