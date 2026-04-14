@@ -2,7 +2,7 @@ import numpy as np
 import time
 from scalib.modeling import RLDAClassifier
 
-NB = 32
+NB = 20
 NS = 3
 P = 3
 NV = 1
@@ -40,14 +40,14 @@ rlda.solve()
 eval_labels = rng.integers(0, 2**NB, N_EVAL, dtype=np.uint64)
 eval_traces = make_traces(eval_labels, N_EVAL)
 
-breakpoint()
 
 # Benchmark — only time this
-N_REPEATS = 5
+N_REPEATS = 2
 times = []
 for _ in range(N_REPEATS):
     t0 = time.perf_counter()
     # your get_info call goes here
+    rlda.get_info(eval_traces, eval_labels, 0)
     t1 = time.perf_counter()
     times.append(t1 - t0)
 

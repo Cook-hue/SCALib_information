@@ -59,6 +59,19 @@ impl RLDA {
             .map_err(|e| ScalibError::from_scalib(e, py))
     }
 
+    fn get_info(
+        &self,
+        py: Python,
+        x: PyReadonlyArray2<i16>,
+        labels: PyReadonlyArray1<u64>,
+        v: usize,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let x = x.as_array();
+        let labels = labels.as_array();
+        let result = self.inner.as_ref().unwrap().get_info(x, labels, v);
+        Ok(result.into_pyarray(py).into())
+    }
+
     fn predict_proba<'py>(
         &self,
         py: Python<'py>,

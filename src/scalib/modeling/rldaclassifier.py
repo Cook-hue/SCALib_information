@@ -133,6 +133,30 @@ class RLDAClassifier:
         """
         return self._inner.get_proj_coefs()
 
+    def get_info(
+        self, traces: npt.NDArray[np.int16], labels: npt.NDArray[np.uint64], var: int
+    ) -> npt.NDArray[np.float64]:
+        """Compute log2 probability of the correct class for each trace.
+
+        Parameters
+        ----------
+        traces:
+            Array that contains the traces. Shape ``(n,ns)``.
+        labels:
+            Correct class for each trace. Shape ``(n,)``.
+        var:
+            Id of the variable for which the information is computed.
+
+        Returns
+        -------
+        array_like, f64
+            Log2 probabilities of correct class. Shape ``(n,)``.
+        """
+        assert self._solved, "Model not solved"
+        traces = scalib.utils.clean_traces(traces, self._ns)
+        labels = np.asarray(labels, dtype=np.uint64)
+        return self._inner.get_info(traces, labels, var)
+
     def predict_proba(
         self, traces: npt.NDArray[np.int16], var: int
     ) -> npt.NDArray[np.float64]:

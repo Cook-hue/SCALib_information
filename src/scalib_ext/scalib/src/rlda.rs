@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::convert::TryInto;
 use std::ops::{AddAssign, SubAssign};
+use std::time::Instant;
 
 // NBITS_CHUNKS defines the size in bits of the precomputed mean chunks. By default, 8bit chunks are used.
 const NBITS_CHUNK: usize = 8;
@@ -336,6 +337,83 @@ impl RLDA {
         );
     }
 
+    pub fn get_info(&self, x: ArrayView2<i16>, labels: ArrayView1<u64>, v: usize) -> Array1<f64> {
+        use std::f64::consts::LOG2_E;
+
+        // Project traces: shape (nt, p)
+        let x = x
+            .mapv(|x| x as f64)
+            .dot(&self.norm_proj.slice(s![v, .., ..]).t());
+
+        let nt = x.len_of(Axis(0));
+        let mut result = Array1::<f64>::zeros(nt);
+
+        let n_chunks = (self.nb + NBITS_CHUNK - 1) / NBITS_CHUNK;
+
+        Zip::from(result.view_mut())
+            .and(x.outer_iter())
+            .and(labels)
+            .for_each(|res, trace, &label| {
+                // Compute scores for all 2^nb classes using chunk structure
+                // and track max on the fly
+                let mut max_score = f64::NEG_INFINITY;
+                let mut scores = vec![0.0f64; 1 << self.nb];
+
+                let calculate_sqdist =
+                    |chunk_index: usize, scores_chunk: &mut [f64], tmp_mu: &mut Vec<f64>| {
+                        // Build tmp_mu: trace minus all MSB chunks
+                        for j in 0..self.p {
+                            tmp_mu[j] = trace[[j]];
+                            for chunk in 0..(n_chunks - 1) {
+                                let i_chunk =
+                                    (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
+                                tmp_mu[j] -= self.mu_chunks[[v, chunk + 1, i_chunk, j]];
+                            }
+                        }
+                        // Inner LSB loop
+                        for i_lsb in 0..std::cmp::min(SIZE_CHUNK, 1 << self.nb) {
+                            let mut sq = 0.0f64;
+                            for j in 0..self.p {
+                                let acc = tmp_mu[j] - self.mu_chunks[[v, 0, i_lsb, j]];
+                                sq += acc * acc;
+                            }
+                            scores_chunk[i_lsb] = -0.5 * sq;
+                        }
+                    };
+
+                // Fill scores using chunk split — same as predict_proba
+                if self.nb < NBITS_CHUNK {
+                    let mut tmp_mu = vec![0.0f64; self.p];
+                    calculate_sqdist(0, &mut scores[..], &mut tmp_mu);
+                } else {
+                    let n_outer = (1usize << self.nb) / SIZE_CHUNK;
+                    let mut tmp_mu = vec![0.0f64; self.p];
+                    for chunk_index in 0..n_outer {
+                        let base = chunk_index * SIZE_CHUNK;
+                        calculate_sqdist(
+                            chunk_index,
+                            &mut scores[base..base + SIZE_CHUNK],
+                            &mut tmp_mu,
+                        );
+                    }
+                }
+
+                // Find max
+                for &s in scores.iter() {
+                    if s > max_score {
+                        max_score = s;
+                    }
+                }
+
+                // Compute log2_softmax_i
+                let exp_sum: f64 = scores.iter().map(|&s| (s - max_score).exp()).sum();
+                let correct_score = scores[label as usize & ((1 << self.nb) - 1)];
+                *res = (correct_score - max_score) * LOG2_E - exp_sum.log2();
+            });
+
+        result
+    }
+
     /// return the probability of each of the possible value for leakage samples
     /// x : traces with shape (n,ns)
     /// v : index of variable that we want to get the probabilities
@@ -346,6 +424,7 @@ impl RLDA {
         //
         // This method is called in predict_proba, per chunks of SIZE_CHUNK scores to calculate.
         // It calculates and stores the sqdist of classes chunk_index*SIZE_CHUNK to (chunk_index+1)*SIZE_CHUNK-1
+        let t0 = Instant::now();
         let calculate_sqdist = |chunk_index: usize,
                                 mut scores_chunk: ArrayViewMut1<f64>,
                                 tmp_mu: &mut Array1<f64>,
@@ -420,6 +499,8 @@ impl RLDA {
         for score_distr in scores.outer_iter_mut() {
             softmax(score_distr);
         }
+        let t1 = Instant::now();
+        eprintln!("predict_proba:  {:.3?}", t1 - t0);
         return scores;
     }
 }
