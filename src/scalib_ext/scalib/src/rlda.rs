@@ -99,26 +99,33 @@ fn int2mul(x: u64) -> f64 {
     }
 }
 
-/// Fast approximate exp(x) using bit manipulation.
-/// Error < 4% for x in [-87, 0] (our range since scores are always <= 0 after max subtraction)
-/// ~4x faster than f64::exp() due to avoiding the full IEEE754 range reduction
 #[inline(always)]
 fn fast_exp(x: f64) -> f64 {
     // Clamp to avoid undefined behavior outside float range
+    // Our inputs are always <= 0 after max subtraction, so -87 is a safe floor
     let x = x.max(-87.0);
-    // Use the identity: exp(x) = 2^(x * log2(e))
-    // Then exploit the IEEE754 float layout to compute 2^n cheaply
+
+    // Compute exp(x) as 2^(x * log2(e))
+    // This lets us exploit the IEEE754 float bit layout to compute powers of 2 cheaply
     let t = x * 1.4426950408889634; // x * log2(e)
-    let s = (1u64 << 52) as f64;
+
+    // Split t into integer part w and fractional part r
     let w = t.floor();
     let r = t - w;
-    // Polynomial approximation of 2^r for r in [0,1]
+
+    // Polynomial approximation of 2^r for r in [0, 1]
+    // Coefficients are the Taylor series of 2^r around 0
     let approx = 1.0 + r * (0.6931471805599453 + r * (0.2402265069591007 + r * 0.0555041086648216));
-    // Combine exponent and mantissa via bit cast
+
+    // Reconstruct 2^w using IEEE754 bit manipulation
+    // For a double, the exponent field starts at bit 52, biased by 1023
     let bits = ((w as i64 + 1023) << 52) as u64;
     let exp2w = f64::from_bits(bits);
+
+    // Combine integer and fractional parts: 2^t = 2^w * 2^r
     exp2w * approx
 }
+
 impl RLDA {
     /// Create new RLDA object based on
     /// nb : number of bits of the model
@@ -360,38 +367,82 @@ impl RLDA {
     pub fn get_info(&self, x: ArrayView2<i16>, labels: ArrayView1<u64>, v: usize) -> Array1<f64> {
         use std::f64::consts::LOG2_E;
 
+        // Project traces from ns dimensions down to p dimensions
+        // using the precomputed whitened projection matrix for variable v
+        // x shape: (nt, ns) -> (nt, p)
         let x = x
             .mapv(|x| x as f64)
             .dot(&self.norm_proj.slice(s![v, .., ..]).t());
 
         let nt = x.len_of(Axis(0));
         let mut result = Array1::<f64>::zeros(nt);
-        let n_chunks = (self.nb + NBITS_CHUNK - 1) / NBITS_CHUNK;
-        let n_outer = (1usize << self.nb) / SIZE_CHUNK;
 
-        // Pre-extract mu_chunks as a flat slice — shape (n_chunks, SIZE_CHUNK, p)
-        // Layout is C-contiguous: mu[chunk, byte, j] = raw[chunk * SIZE_CHUNK * p + byte * p + j]
+        let n_chunks = (self.nb + NBITS_CHUNK - 1) / NBITS_CHUNK;
+        // When nb < NBITS_CHUNK, all classes fit in a single LSB chunk.
+        // n_outer=1 means one outer iteration with no MSB chunks.
+        // n_lsb caps the inner loop at the actual number of classes.
+        let n_outer = if self.nb >= NBITS_CHUNK {
+            (1usize << self.nb) / SIZE_CHUNK
+        } else {
+            1
+        };
+        let n_lsb = std::cmp::min(SIZE_CHUNK, 1 << self.nb);
+
+        // Extract the mu_chunks slice for variable v
+        // Shape: (n_chunks, SIZE_CHUNK, p)
+        // mu_chunks[chunk, byte, j] is the contribution of byte value `byte`
+        // in chunk `chunk` to dimension j of the projected mean
         let mu = self.mu_chunks.slice(s![v, .., .., ..]);
+
+        // Get a flat raw slice for zero-cost indexing in the hot loop
+        // Layout is C-contiguous: index = chunk * SIZE_CHUNK * p + byte * p + j
         let mu_raw = mu.as_slice().expect("mu_chunks must be contiguous");
         let p = self.p;
 
-        // Helper: access mu[chunk, byte, j] from raw slice
-        // avoids all ndarray stride arithmetic in the hot loop
+        // Inline accessor for mu_raw that computes the flat index
         let mu_get = |chunk: usize, byte: usize, j: usize| -> f64 {
             mu_raw[chunk * SIZE_CHUNK * p + byte * p + j]
         };
 
+        // Process each trace in parallel using Rayon
+        // Each trace is independent so this is embarrassingly parallel
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
             .into_par_iter()
             .for_each(|(res, trace, &label)| {
-                // Extract trace as raw slice — avoids ndarray indexing in j loop
+                // Raw slice access to avoid ndarray bounds checking in the hot loop
                 let trace_raw = trace.as_slice().expect("trace must be contiguous");
+
+                // We compute log2 Pr(X=label | trace) using the log-sum-exp trick:
+                //
+                //   log2 Pr(X=label | trace)
+                //     = (score(label) - max_score) * log2(e)
+                //       - log2( sum_c exp(score(c) - max_score) )
+                //
+                // where score(c) = -0.5 * ||proj(trace) - mu_c||^2
+                // and max_score = max_c score(c)
+                //
+                // Subtracting max_score before exp() keeps values in (-inf, 0]
+                // which prevents overflow and improves numerical stability.
+                //
+                // The mean mu_c is decomposed into chunks:
+                //   mu_c = sum_{chunk} mu_chunks[chunk, byte(c, chunk), :]
+                // where byte(c, chunk) = (c >> (chunk * NBITS_CHUNK)) & 0xFF
+                //
+                // The outer loop fixes the MSB chunks (chunks 1..n_chunks),
+                // computing tmp_mu = trace - sum of MSB chunk contributions.
+                // The inner loop then varies only the LSB chunk (chunk 0),
+                // reusing tmp_mu across all 256 LSB values.
+                // This amortizes the MSB computation over 256 inner iterations.
+
+                // Pass 1: find the maximum score over all 2^nb classes
+                // Needed for numerical stability in the exp() computation
                 let mut max_score = f64::NEG_INFINITY;
 
-                // ── pass 1: find max ──────────────────────────────────────────
                 for chunk_index in 0..n_outer {
+                    // Build tmp_mu: trace minus the contribution of MSB chunks
+                    // chunk_index encodes the values of chunks 1..n_chunks
                     let mut tmp_mu = [0.0f64; 3];
                     for j in 0..p {
                         tmp_mu[j] = trace_raw[j];
@@ -400,7 +451,9 @@ impl RLDA {
                             tmp_mu[j] -= mu_get(chunk + 1, i_chunk, j);
                         }
                     }
-                    for i_lsb in 0..SIZE_CHUNK {
+                    // Inner loop: vary the LSB chunk over all 256 possible byte values
+                    // score(c) = -0.5 * ||tmp_mu - mu_chunks[0, i_lsb, :]||^2
+                    for i_lsb in 0..n_lsb {
                         let mut sq = 0.0f64;
                         for j in 0..p {
                             let acc = tmp_mu[j] - mu_get(0, i_lsb, j);
@@ -413,7 +466,9 @@ impl RLDA {
                     }
                 }
 
-                // ── pass 2: accumulate exp(score - max) ───────────────────────
+                // Pass 2: compute sum_c exp(score(c) - max_score) over all 2^nb classes
+                // Same chunk structure as pass 1, recomputing tmp_mu
+                // Using fast_exp instead of f64::exp for ~4x speedup with ~4% error
                 let mut exp_sum = 0.0f64;
                 for chunk_index in 0..n_outer {
                     let mut tmp_mu = [0.0f64; 3];
@@ -424,7 +479,7 @@ impl RLDA {
                             tmp_mu[j] -= mu_get(chunk + 1, i_chunk, j);
                         }
                     }
-                    for i_lsb in 0..SIZE_CHUNK {
+                    for i_lsb in 0..n_lsb {
                         let mut sq = 0.0f64;
                         for j in 0..p {
                             let acc = tmp_mu[j] - mu_get(0, i_lsb, j);
@@ -434,7 +489,9 @@ impl RLDA {
                     }
                 }
 
-                // ── correct class score ───────────────────────────────────────
+                // Compute the score for the correct class only
+                // This is the numerator of the softmax — computed directly
+                // from the label without iterating over all classes
                 let correct_score = {
                     let mut sq = 0.0f64;
                     for j in 0..p {
@@ -448,10 +505,10 @@ impl RLDA {
                     }
                     -0.5 * sq
                 };
-
+                // Add this debug print in get_info, before *res = ...
+                // Final log2 softmax for the correct class
                 *res = (correct_score - max_score) * LOG2_E - exp_sum.log2();
             });
-
         result
     }
 

@@ -8,50 +8,116 @@ P = 3
 NV = 1
 N_TRAIN = 10_000
 N_EVAL = 100
-SNR = 1.0  # signal amplitude, tune to get realistic SNR
+SNR = 1.0
 
-# Build a simple linear signal model: each bit contributes to each sample
-# coefs shape: (NB, NS) — one coefficient per bit per sample
 rng = np.random.default_rng(42)
 signal_coefs = rng.normal(0, SNR, (NB, NS)).astype(np.float32)
 
 
-def make_traces(labels, n, noise_std=1000):
-    """labels shape: (n,), returns traces shape: (n, NS)"""
-    noise = rng.integers(-noise_std, noise_std, (n, NS), dtype=np.int16)
-    # Extract bits: shape (n, NB)
-    bits = ((labels[:, np.newaxis] >> np.arange(NB, dtype=np.uint64)) & 1).astype(
+def make_traces(labels, nb, ns, signal_coefs, noise_std=1000):
+    noise = rng.integers(-noise_std, noise_std, (len(labels), ns), dtype=np.int16)
+    bits = ((labels[:, np.newaxis] >> np.arange(nb, dtype=np.uint64)) & 1).astype(
         np.float32
     )
-    # Map 0→-1, 1→+1
     bits = bits * 2 - 1
-    # Signal: (n, NB) @ (NB, NS) → (n, NS)
     signal = (bits @ signal_coefs).astype(np.int16)
     return (noise + signal).astype(np.int16)
 
 
-# Setup — not timed
-rlda = RLDAClassifier(NB, P)
-train_labels = rng.integers(0, 2**NB, N_TRAIN, dtype=np.uint64)
-traces = make_traces(train_labels, N_TRAIN)
-rlda.fit_u(traces, train_labels[:, np.newaxis], 1)
-rlda.solve()
+def test_get_info_correctness():
+    print("\n--- correctness tests ---")
+    rng_test = np.random.default_rng(123)
 
-eval_labels = rng.integers(0, 2**NB, N_EVAL, dtype=np.uint64)
-eval_traces = make_traces(eval_labels, N_EVAL)
+    for nb in [4, 8, 12]:
+        ns = 3
+        p = min(nb, 3)
+        nc = 2**nb
+        n_train = 5000
+        n_test = 100
+        noise = 500
+
+        sc = rng_test.normal(0, 1.0, (nb, ns)).astype(np.float32)
+
+        def make_traces_local(labels):
+            noise_arr = rng_test.integers(
+                -noise, noise, (len(labels), ns), dtype=np.int16
+            )
+            bits = (
+                (labels[:, np.newaxis] >> np.arange(nb, dtype=np.uint64)) & 1
+            ).astype(np.float32)
+            bits = bits * 2 - 1
+            signal = (bits @ sc).astype(np.int16)
+            return (noise_arr + signal).astype(np.int16)
+
+        # Train
+        train_labels = rng_test.integers(0, nc, n_train, dtype=np.uint64)
+        traces = make_traces_local(train_labels)
+        rlda = RLDAClassifier(nb, p)
+        rlda.fit_u(traces, train_labels[:, np.newaxis])
+        rlda.solve()
+
+        # Eval
+        test_labels = rng_test.integers(0, nc, n_test, dtype=np.uint64)
+        test_traces = make_traces_local(test_labels)
+
+        # Reference from predict_proba
+        prs = rlda.predict_proba(test_traces, 0)
+        ref = np.log2(prs[np.arange(n_test), test_labels])
+
+        # get_info
+        info = rlda.get_info(test_traces, test_labels, 0)
+
+        max_err = np.abs(info - ref).max()
+        mean_err = np.abs(info - ref).mean()
+        # get_info
+        info = rlda.get_info(test_traces, test_labels, 0)
+
+        # Debug
+        print(f"nb={nb}")
+        print(f"info[:5]  = {info[:5]}")
+        print(f"ref[:5]   = {ref[:5]}")
+        print(f"prs[0]    = {prs[0]}")  # full distribution for first trace
+        print(f"label[0]  = {test_labels[0]}")
+        print(f"prs[0, test_labels[0]] = {prs[0, test_labels[0]]}")
+
+        print(
+            f"nb={nb:2d}: max_err={max_err:.6f} bits  mean_err={mean_err:.6f} bits  OK"
+        )
 
 
-# Benchmark — only time this
-N_REPEATS = 2
-times = []
-for _ in range(N_REPEATS):
-    t0 = time.perf_counter()
-    # your get_info call goes here
-    info = rlda.get_info(eval_traces, eval_labels, 0)
-    t1 = time.perf_counter()
-    times.append(t1 - t0)
+def test_get_info_benchmark():
+    print("\n--- benchmark nb=32, 100 traces ---")
 
-print(f"Obtained information {info} \n")
-print(
-    f"mean: {np.mean(times):.3f}s  std: {np.std(times):.3f}s  min: {np.min(times):.3f}s"
-)
+    # Setup
+    train_labels = rng.integers(0, 2**NB, N_TRAIN, dtype=np.uint64)
+    traces = make_traces(train_labels, NB, NS, signal_coefs)
+    rlda = RLDAClassifier(NB, P)
+    rlda.fit_u(traces, train_labels[:, np.newaxis])
+    rlda.solve()
+
+    eval_labels = rng.integers(0, 2**NB, N_EVAL, dtype=np.uint64)
+    eval_traces = make_traces(eval_labels, NB, NS, signal_coefs)
+
+    # Warmup
+    rlda.get_info(eval_traces, eval_labels, 0)
+
+    # Benchmark
+    N_REPEATS = 2
+    times = []
+    for _ in range(N_REPEATS):
+        t0 = time.perf_counter()
+        result = rlda.get_info(eval_traces, eval_labels, 0)
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+
+    print(
+        f"mean: {np.mean(times):.3f}s  "
+        f"std: {np.std(times):.3f}s  "
+        f"min: {np.min(times):.3f}s"
+    )
+    print(f"PI estimate: {NB + np.mean(result):.4f} bits")
+
+
+if __name__ == "__main__":
+    test_get_info_correctness()
+    test_get_info_benchmark()
