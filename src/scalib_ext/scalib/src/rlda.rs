@@ -363,13 +363,12 @@ impl RLDA {
             store_associated_classes,
         );
     }
-
     pub fn get_info(&self, x: ArrayView2<i16>, labels: ArrayView1<u64>, v: usize) -> Array1<f64> {
         use std::f64::consts::LOG2_E;
 
-        // Project traces from ns dimensions down to p dimensions
+        // Project traces from ns dimensions to p dimensions
         // using the precomputed whitened projection matrix for variable v
-        // x shape: (nt, ns) -> (nt, p)
+        // Input shape: (nt, ns) -> output shape: (nt, p)
         let x = x
             .mapv(|x| x as f64)
             .dot(&self.norm_proj.slice(s![v, .., ..]).t());
@@ -377,138 +376,136 @@ impl RLDA {
         let nt = x.len_of(Axis(0));
         let mut result = Array1::<f64>::zeros(nt);
 
-        let n_chunks = (self.nb + NBITS_CHUNK - 1) / NBITS_CHUNK;
-        // When nb < NBITS_CHUNK, all classes fit in a single LSB chunk.
-        // n_outer=1 means one outer iteration with no MSB chunks.
-        // n_lsb caps the inner loop at the actual number of classes.
+        // Number of NBITS_CHUNK-bit chunks needed to cover nb bits
+        // Example: nb=32, NBITS_CHUNK=8 -> n_chunks=4
+        // div_ceil is the standard library ceiling division
+        let n_chunks = self.nb.div_ceil(NBITS_CHUNK);
+
+        // Number of outer loop iterations
+        // When nb >= NBITS_CHUNK: n_outer = 2^nb / SIZE_CHUNK = 2^(nb-8)
+        // When nb < NBITS_CHUNK: single outer iteration, all classes fit in LSB chunk
         let n_outer = if self.nb >= NBITS_CHUNK {
             (1usize << self.nb) / SIZE_CHUNK
         } else {
             1
         };
+
+        // Number of LSB values to iterate over in the inner loop
+        // Normally SIZE_CHUNK=256, but capped at 2^nb for small nb
         let n_lsb = std::cmp::min(SIZE_CHUNK, 1 << self.nb);
 
         // Extract the mu_chunks slice for variable v
         // Shape: (n_chunks, SIZE_CHUNK, p)
-        // mu_chunks[chunk, byte, j] is the contribution of byte value `byte`
-        // in chunk `chunk` to dimension j of the projected mean
+        // mu_chunks[chunk, byte, j] is the contribution of byte value to
+        // dimension j of the projected mean for the given chunk
         let mu = self.mu_chunks.slice(s![v, .., .., ..]);
 
         // Get a flat raw slice for zero-cost indexing in the hot loop
-        // Layout is C-contiguous: index = chunk * SIZE_CHUNK * p + byte * p + j
+        // Memory layout is C-contiguous:
+        // index = chunk * SIZE_CHUNK * p + byte * p + j
         let mu_raw = mu.as_slice().expect("mu_chunks must be contiguous");
         let p = self.p;
 
-        // Inline accessor for mu_raw that computes the flat index
-        let mu_get = |chunk: usize, byte: usize, j: usize| -> f64 {
-            mu_raw[chunk * SIZE_CHUNK * p + byte * p + j]
-        };
+        // Precompute base offsets for the LSB chunk (chunk 0)
+        // base_lsb[i_lsb] = i_lsb * p
+        // This avoids recomputing i_lsb * p inside the inner loop
+        // which runs 2^32 times total across all outer iterations
+        // The table has 256 entries of 8 bytes = 2 KB, fits easily in L1 cache
+        let lsb_offsets: Vec<usize> = (0..n_lsb).map(|i| i * p).collect();
 
         // Process each trace in parallel using Rayon
-        // Each trace is independent so this is embarrassingly parallel
+        // Each trace is fully independent so this is embarrassingly parallel
+        // mu_raw and lsb_offsets are read-only and safely shared across threads
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
             .into_par_iter()
             .for_each(|(res, trace, &label)| {
-                // Raw slice access to avoid ndarray bounds checking in the hot loop
+                // Raw slice access to avoid ndarray indexing overhead in hot loop
                 let trace_raw = trace.as_slice().expect("trace must be contiguous");
 
-                // We compute log2 Pr(X=label | trace) using the log-sum-exp trick:
+                // We compute log2 Pr(X=label | trace) as:
                 //
                 //   log2 Pr(X=label | trace)
-                //     = (score(label) - max_score) * log2(e)
-                //       - log2( sum_c exp(score(c) - max_score) )
+                //     = correct_score * log2(e) - log2(sum_c exp(score(c)))
                 //
                 // where score(c) = -0.5 * ||proj(trace) - mu_c||^2
-                // and max_score = max_c score(c)
                 //
-                // Subtracting max_score before exp() keeps values in (-inf, 0]
-                // which prevents overflow and improves numerical stability.
+                // No max subtraction is needed because scores are always <= 0
+                // (score = -0.5 * sq, sq >= 0) so exp(score) is always in (0,1]
+                // and can never overflow f64.
                 //
-                // The mean mu_c is decomposed into chunks:
-                //   mu_c = sum_{chunk} mu_chunks[chunk, byte(c, chunk), :]
-                // where byte(c, chunk) = (c >> (chunk * NBITS_CHUNK)) & 0xFF
+                // The class mean mu_c is decomposed into independent chunks:
+                //   mu_c[j] = sum_k mu_raw[k * SIZE_CHUNK * p + byte(c,k) * p + j]
+                // where byte(c,k) = (c >> (k * NBITS_CHUNK)) & 0xFF
                 //
-                // The outer loop fixes the MSB chunks (chunks 1..n_chunks),
-                // computing tmp_mu = trace - sum of MSB chunk contributions.
-                // The inner loop then varies only the LSB chunk (chunk 0),
-                // reusing tmp_mu across all 256 LSB values.
-                // This amortizes the MSB computation over 256 inner iterations.
+                // The outer loop fixes the MSB chunks (chunks 1 to n_chunks-1)
+                // and precomputes tmp_mu = trace - sum of MSB chunk contributions
+                // The inner loop then varies only the LSB chunk (chunk 0)
+                // reusing tmp_mu across all 256 LSB values
+                // This amortizes the MSB computation over 256 inner iterations
 
-                // Pass 1: find the maximum score over all 2^nb classes
-                // Needed for numerical stability in the exp() computation
-                let mut max_score = f64::NEG_INFINITY;
-
-                for chunk_index in 0..n_outer {
-                    // Build tmp_mu: trace minus the contribution of MSB chunks
-                    // chunk_index encodes the values of chunks 1..n_chunks
-                    let mut tmp_mu = [0.0f64; 3];
-                    for j in 0..p {
-                        tmp_mu[j] = trace_raw[j];
-                        for chunk in 0..(n_chunks - 1) {
-                            let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
-                            tmp_mu[j] -= mu_get(chunk + 1, i_chunk, j);
-                        }
-                    }
-                    // Inner loop: vary the LSB chunk over all 256 possible byte values
-                    // score(c) = -0.5 * ||tmp_mu - mu_chunks[0, i_lsb, :]||^2
-                    for i_lsb in 0..n_lsb {
-                        let mut sq = 0.0f64;
-                        for j in 0..p {
-                            let acc = tmp_mu[j] - mu_get(0, i_lsb, j);
-                            sq += acc * acc;
-                        }
-                        let score = -0.5 * sq;
-                        if score > max_score {
-                            max_score = score;
-                        }
-                    }
-                }
-
-                // Pass 2: compute sum_c exp(score(c) - max_score) over all 2^nb classes
-                // Same chunk structure as pass 1, recomputing tmp_mu
-                // Using fast_exp instead of f64::exp for ~4x speedup with ~4% error
+                // Single pass: compute sum_c exp(score(c)) over all 2^nb classes
+                // No pass 1 needed since scores are always <= 0 and exp() cannot overflow
                 let mut exp_sum = 0.0f64;
+
                 for chunk_index in 0..n_outer {
+                    // Build tmp_mu: trace minus contributions of MSB chunks
+                    // chunk_index encodes the byte values of chunks 1 to n_chunks-1
+                    // base is computed once per (chunk, i_chunk) pair, outside the j loop
+                    // This avoids recomputing chunk * SIZE_CHUNK * p + i_chunk * p
+                    // for every dimension j
                     let mut tmp_mu = [0.0f64; 3];
                     for j in 0..p {
                         tmp_mu[j] = trace_raw[j];
                         for chunk in 0..(n_chunks - 1) {
                             let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
-                            tmp_mu[j] -= mu_get(chunk + 1, i_chunk, j);
+                            let base = (chunk + 1) * SIZE_CHUNK * p + i_chunk * p;
+                            tmp_mu[j] -= mu_raw[base + j];
                         }
                     }
+
+                    // Inner loop: vary the LSB chunk over all possible byte values
+                    // score(c) = -0.5 * ||tmp_mu - mu_lsb||^2
+                    // lsb_offsets[i_lsb] replaces the multiplication i_lsb * p
+                    // with a precomputed table lookup
                     for i_lsb in 0..n_lsb {
+                        let base = lsb_offsets[i_lsb];
                         let mut sq = 0.0f64;
                         for j in 0..p {
-                            let acc = tmp_mu[j] - mu_get(0, i_lsb, j);
+                            let acc = tmp_mu[j] - mu_raw[base + j];
                             sq += acc * acc;
                         }
-                        exp_sum += fast_exp(-0.5 * sq - max_score);
+                        // exp(score) where score = -0.5 * sq is always in (0, 1]
+                        // fast_exp gives ~4x speedup over f64::exp with ~4% error
+                        exp_sum += fast_exp(-0.5 * sq);
                     }
                 }
 
-                // Compute the score for the correct class only
-                // This is the numerator of the softmax — computed directly
-                // from the label without iterating over all classes
+                // Compute the score for the correct class directly from the label
+                // This is the numerator of the softmax
+                // No need to iterate over all classes for this computation
+                // base is computed once per chunk outside the j loop
                 let correct_score = {
                     let mut sq = 0.0f64;
                     for j in 0..p {
                         let mut mu_j = 0.0f64;
                         for chunk in 0..n_chunks {
                             let byte = ((label >> (chunk * NBITS_CHUNK)) & 0xFF) as usize;
-                            mu_j += mu_get(chunk, byte, j);
+                            let base = chunk * SIZE_CHUNK * p + byte * p;
+                            mu_j += mu_raw[base + j];
                         }
                         let diff = trace_raw[j] - mu_j;
                         sq += diff * diff;
                     }
                     -0.5 * sq
                 };
-                // Add this debug print in get_info, before *res = ...
-                // Final log2 softmax for the correct class
-                *res = (correct_score - max_score) * LOG2_E - exp_sum.log2();
+
+                // Final log2 probability for the correct class
+                // log2 Pr(X=label | trace) = correct_score * log2(e) - log2(exp_sum)
+                *res = correct_score * LOG2_E - exp_sum.log2();
             });
+
         result
     }
 

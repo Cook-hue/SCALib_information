@@ -2,3 +2,6 @@
 
 members = ["geigen", "scalib", "ranklib", "scalib-py", "cpu-check"]
 resolver = "2"
+
+[profile.release]
+debug = 1

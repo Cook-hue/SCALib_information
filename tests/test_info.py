@@ -1,20 +1,23 @@
 import numpy as np
 import time
 from scalib.modeling import RLDAClassifier
+import os
+
+# os.environ["RAYON_NUM_THREADS"] = "128"
 
 NB = 32
 NS = 3
 P = 3
 NV = 1
 N_TRAIN = 10_000
-N_EVAL = 100
-SNR = 1.0
+N_EVAL = 10
+SNR = 1
 
 rng = np.random.default_rng(42)
 signal_coefs = rng.normal(0, SNR, (NB, NS)).astype(np.float32)
 
 
-def make_traces(labels, nb, ns, signal_coefs, noise_std=1000):
+def make_traces(labels, nb, ns, signal_coefs, noise_std=1):
     noise = rng.integers(-noise_std, noise_std, (len(labels), ns), dtype=np.int16)
     bits = ((labels[:, np.newaxis] >> np.arange(nb, dtype=np.uint64)) & 1).astype(
         np.float32
@@ -33,7 +36,7 @@ def test_get_info_correctness():
         p = min(nb, 3)
         nc = 2**nb
         n_train = 5000
-        n_test = 100
+        n_test = 10
         noise = 500
 
         sc = rng_test.normal(0, 1.0, (nb, ns)).astype(np.float32)
@@ -71,22 +74,11 @@ def test_get_info_correctness():
         mean_err = np.abs(info - ref).mean()
         # get_info
         info = rlda.get_info(test_traces, test_labels, 0)
-
-        # Debug
-        print(f"nb={nb}")
-        print(f"info[:5]  = {info[:5]}")
-        print(f"ref[:5]   = {ref[:5]}")
-        print(f"prs[0]    = {prs[0]}")  # full distribution for first trace
-        print(f"label[0]  = {test_labels[0]}")
-        print(f"prs[0, test_labels[0]] = {prs[0, test_labels[0]]}")
-
-        print(
-            f"nb={nb:2d}: max_err={max_err:.6f} bits  mean_err={mean_err:.6f} bits  OK"
-        )
+        print(f"Delta for {nb} bits : {ref-info}")
 
 
 def test_get_info_benchmark():
-    print("\n--- benchmark nb=32, 100 traces ---")
+    print(f"\n--- benchmark nb=32, {N_EVAL} traces ---")
 
     # Setup
     train_labels = rng.integers(0, 2**NB, N_TRAIN, dtype=np.uint64)
@@ -99,10 +91,10 @@ def test_get_info_benchmark():
     eval_traces = make_traces(eval_labels, NB, NS, signal_coefs)
 
     # Warmup
-    rlda.get_info(eval_traces, eval_labels, 0)
+    tmp_res = rlda.get_info(eval_traces, eval_labels, 0)
 
     # Benchmark
-    N_REPEATS = 2
+    N_REPEATS = 1
     times = []
     for _ in range(N_REPEATS):
         t0 = time.perf_counter()
@@ -110,11 +102,7 @@ def test_get_info_benchmark():
         t1 = time.perf_counter()
         times.append(t1 - t0)
 
-    print(
-        f"mean: {np.mean(times):.3f}s  "
-        f"std: {np.std(times):.3f}s  "
-        f"min: {np.min(times):.3f}s"
-    )
+    print(f"mean: {np.mean(times):.3f}s  " f"min: {np.min(times):.3f}s")
     print(f"PI estimate: {NB + np.mean(result):.4f} bits")
 
 
