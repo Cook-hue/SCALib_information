@@ -1,5 +1,7 @@
 use crate::ScalibError;
 
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::*;
 use geigen::Geigen;
 use kdtree::{distance::squared_euclidean, KdTree};
 use ndarray::{
@@ -13,7 +15,6 @@ use std::cmp::min;
 use std::convert::TryInto;
 use std::ops::{AddAssign, SubAssign};
 use std::time::Instant;
-
 // NBITS_CHUNKS defines the size in bits of the precomputed mean chunks. By default, 8bit chunks are used.
 const NBITS_CHUNK: usize = 8;
 const SIZE_CHUNK: usize = 1 << NBITS_CHUNK;
@@ -439,7 +440,8 @@ impl RLDA {
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
-            .for_each(|res, trace, &label| {
+            .into_par_iter()
+            .for_each(|(res, trace, &label)| {
                 // Raw slice access to avoid ndarray indexing overhead in hot loop
                 let trace_raw = trace.as_slice().expect("trace must be contiguous");
 
@@ -468,7 +470,7 @@ impl RLDA {
                 // No pass 1 needed since scores are always <= 0 and exp() cannot overflow
 
                 assert_eq!(self.nb % n_chunks, 0);
-                let exp_sum = pass2(trace_raw, mu_chunks_t.view());
+                let exp_sum = unsafe { pass2(trace_raw, mu_chunks_t.view()) };
 
                 // Compute the score for the correct class directly from the label
                 // This is the numerator of the softmax
@@ -588,6 +590,8 @@ impl RLDA {
 }
 
 // Need: n_chunk multiple of nb
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,avx2,fma")]
 #[inline(never)]
 fn pass2(
     // length: p
@@ -600,15 +604,24 @@ fn pass2(
     let n_chunks = mu_chunks_t.shape()[0];
     assert_eq!(SIZE_CHUNK, mu_chunks_t.shape()[2]);
 
-    let mut exp_sum = 0.0f64;
+    let n_outer = SIZE_CHUNK.pow((n_chunks - 1).try_into().unwrap());
 
-    let mut tmp_mu = vec![0.0f64; p];
-    for chunk_index in 0..(SIZE_CHUNK.pow((n_chunks - 1).try_into().unwrap())) {
-        tmp_mu.fill(0.0);
+    // Extract LSB chunk slice ONCE before the hot loop — not inside it
+    // Shape: (p, SIZE_CHUNK) — contiguous along byte dimension
+    let mu_lsb = mu_chunks_t.slice(s![n_chunks - 1, .., ..]);
+    let mu_lsb_raw = mu_lsb.as_slice().expect("mu_lsb must be contiguous");
+    let (mu_lsb_raw, rem) = mu_lsb_raw.as_chunks::<BLOCK_SIZE>();
+    assert!(rem.is_empty());
+    let (mu_lsb_raw, rem) = mu_lsb_raw.as_chunks::<{ SIZE_CHUNK / BLOCK_SIZE }>();
+    assert!(rem.is_empty());
+    assert_eq!(mu_lsb_raw.len(), p);
+
+    let mut exp_sum = 0.0f64;
+    // Stack allocated — no heap, stays in registers
+    let mut tmp_mu = [0.0f64; 3];
+
+    for chunk_index in 0..n_outer {
         // Build tmp_mu: trace minus contributions of MSB chunks
-        // mu_chunks_t has shape (n_chunks, p, SIZE_CHUNK)
-        // mu_chunks_t[[chunk, dim, byte]] is the contribution of byte value
-        // to dimension dim of the projected mean for the given chunk
         for j in 0..p {
             tmp_mu[j] = trace_raw[j];
             for (i_chunk, chunk) in mu_chunks_t
@@ -619,45 +632,25 @@ fn pass2(
                 tmp_mu[j] -= chunk[(chunk_index >> (i_chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1)];
             }
         }
-
-        // Hardcoded path for nb >= NBITS_CHUNK
-        // n_lsb = 256, always a multiple of 4
-        // Extract raw slice of LSB chunk for contiguous AVX2-ready access
-        // mu_chunks_t[[0, j, byte]] for fixed j gives 256 consecutive f64
-        let mu_lsb = mu_chunks_t.slice(s![n_chunks - 1, .., ..]);
-        let mu_lsb_raw = mu_lsb.as_slice().expect("mu_lsb must be contiguous");
-        let (mu_lsb_raw, rem) = mu_lsb_raw.as_chunks::<BLOCK_SIZE>();
-        assert!(rem.is_empty());
-        let (mu_lsb_raw, rem) = mu_lsb_raw.as_chunks::<{ SIZE_CHUNK / BLOCK_SIZE }>();
-        assert!(rem.is_empty());
-        assert_eq!(mu_lsb_raw.len(), p);
-
-        // Process 4 classes simultaneously
-        // sq0..sq3 are independent accumulators — no serial dependency
-        // mu_lsb_raw[j * SIZE_CHUNK + b .. b+4] are 4 consecutive f64
-        // enabling a single _mm256_loadu_pd load per dim per block
-        exp_sum += pass2_inner(&tmp_mu, mu_lsb_raw);
-        /*
-                    // Scalar fallback for nb < NBITS_CHUNK
-                    // n_lsb < 256, small number of classes, performance not critical
-                    for i_lsb in 0..n_lsb {
-                        let mut sq = 0.0f64;
-                        for j in 0..p {
-                            let acc = tmp_mu[j] - mu_chunks_t[[0, j, i_lsb]];
-                            sq += acc * acc;
-                        }
-                        *exp_sum += fast_exp(-0.5 * sq);
-                    }
-        */
+        exp_sum += unsafe { pass2_inner(&tmp_mu[..p], mu_lsb_raw) };
     }
-    return exp_sum;
+    exp_sum
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,avx2,fma")]
 #[inline(never)]
-fn pass2_inner(tmp_mu: &[f64], mu_lsb_raw: &[[[f64; BLOCK_SIZE]; SIZE_CHUNK / BLOCK_SIZE]]) -> f64 {
+unsafe fn pass2_inner(
+    tmp_mu: &[f64],
+    mu_lsb_raw: &[[[f64; BLOCK_SIZE]; SIZE_CHUNK / BLOCK_SIZE]],
+) -> f64 {
+    use core::arch::x86_64::*;
+
     let mut exp_sum_blk = [0.0f64; BLOCK_SIZE];
 
     for block in 0..(SIZE_CHUNK / BLOCK_SIZE) {
+        // Compute squared distances for BLOCK_SIZE=4 classes simultaneously
+        // mul_add compiles to vfmadd231pd with #[target_feature(enable="fma")]
         let sq: [f64; BLOCK_SIZE] =
             tmp_mu
                 .iter()
@@ -668,10 +661,17 @@ fn pass2_inner(tmp_mu: &[f64], mu_lsb_raw: &[[[f64; BLOCK_SIZE]; SIZE_CHUNK / BL
                         tmp.mul_add(tmp, acc[i])
                     })
                 });
-        exp_sum_blk = std::array::from_fn(|i| exp_sum_blk[i] + fast_exp(-0.5 * sq[i]));
+
+        // score = -0.5 * sq, always in (-inf, 0] so exp safe without max
+        // Direct call to exp_avx2 — no CPUID check, guaranteed by #[target_feature]
+        let scores = sq.map(|s| -0.5 * s);
+        let input = _mm256_loadu_pd(scores.as_ptr());
+        let result = crate::avx2_exp::exp_avx2(input);
+        let mut exp_results = [0.0f64; BLOCK_SIZE];
+        _mm256_storeu_pd(exp_results.as_mut_ptr(), result);
+        exp_sum_blk = std::array::from_fn(|i| exp_sum_blk[i] + exp_results[i]);
     }
-    let tmp = exp_sum_blk.into_iter().sum::<f64>();
-    tmp
+    exp_sum_blk.into_iter().sum::<f64>()
 }
 
 #[derive(Serialize, Deserialize)]

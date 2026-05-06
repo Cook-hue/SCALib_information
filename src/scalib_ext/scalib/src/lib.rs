@@ -1,3 +1,4 @@
+mod avx2_exp;
 pub mod belief_propagation;
 pub mod cpa;
 pub mod information;
@@ -10,7 +11,6 @@ pub mod sasca;
 pub mod snr;
 pub mod ttest;
 pub(crate) mod utils;
-
 // Let us make some conservative assuptions regarding cache sizes
 // - L2 = 512 kB
 // - L3/ncores = 2 MB
