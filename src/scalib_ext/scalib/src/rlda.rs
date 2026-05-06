@@ -3,8 +3,8 @@ use crate::ScalibError;
 use geigen::Geigen;
 use kdtree::{distance::squared_euclidean, KdTree};
 use ndarray::{
-    s, Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2,
-    ArrayViewMut3, Axis, NewAxis, Zip,
+    azip, s, Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut1,
+    ArrayViewMut2, ArrayViewMut3, Axis, NewAxis, Zip,
 };
 use nshare::{IntoNalgebra, IntoNdarray1, IntoNdarray2};
 use rayon::prelude::*;
@@ -17,6 +17,7 @@ use std::time::Instant;
 // NBITS_CHUNKS defines the size in bits of the precomputed mean chunks. By default, 8bit chunks are used.
 const NBITS_CHUNK: usize = 8;
 const SIZE_CHUNK: usize = 1 << NBITS_CHUNK;
+const BLOCK_SIZE: usize = 4;
 
 /// RLDA contains accumulator, solver and probability predictor.
 ///
@@ -406,12 +407,31 @@ impl RLDA {
         let mu_raw = mu.as_slice().expect("mu_chunks must be contiguous");
         let p = self.p;
 
-        // Precompute base offsets for the LSB chunk (chunk 0)
-        // base_lsb[i_lsb] = i_lsb * p
-        // This avoids recomputing i_lsb * p inside the inner loop
-        // which runs 2^32 times total across all outer iterations
-        // The table has 256 entries of 8 bytes = 2 KB, fits easily in L1 cache
-        let lsb_offsets: Vec<usize> = (0..n_lsb).map(|i| i * p).collect();
+        // Build transposed mu_chunks for variable v locally
+        // Original: mu_chunks[v, chunk, byte, dim]  layout [byte][dim]
+        // Transposed: mu_chunks_t[chunk, dim, byte]  layout [dim][byte]
+        // Cost: n_chunks * SIZE_CHUNK * p = 4 * 256 * 3 = 3072 copies — negligible
+        // Benefit: contiguous memory access along byte dimension enables AVX2
+
+        //let mut mu_chunks_t = Array3::<f64>::zeros((n_chunks, p, SIZE_CHUNK));
+        // TODO : more clarity : change representation :
+
+        let mut mu_chunks_t = Array3::<f64>::zeros((n_chunks, p, SIZE_CHUNK));
+
+        let mut mu_chunks_t_v = mu_chunks_t.view_mut().permuted_axes([0, 2, 1]);
+        azip!(&mut mu_chunks_t_v, self.mu_chunks.slice(s![v, .., .., ..])).for_each(|t, x| {
+            *t = *x;
+        }); // zip : macro
+
+        /*
+                for chunk in 0..n_chunks {
+                    for byte in 0..n_lsb {
+                        for dim in 0..p {
+                            mu_chunks_t[[chunk, dim, byte]] = self.mu_chunks[[v, chunk, byte, dim]];
+                        }
+                    }
+                }
+        */
 
         // Process each trace in parallel using Rayon
         // Each trace is fully independent so this is embarrassingly parallel
@@ -419,8 +439,7 @@ impl RLDA {
         Zip::from(result.view_mut())
             .and(x.outer_iter())
             .and(labels)
-            .into_par_iter()
-            .for_each(|(res, trace, &label)| {
+            .for_each(|res, trace, &label| {
                 // Raw slice access to avoid ndarray indexing overhead in hot loop
                 let trace_raw = trace.as_slice().expect("trace must be contiguous");
 
@@ -447,40 +466,9 @@ impl RLDA {
 
                 // Single pass: compute sum_c exp(score(c)) over all 2^nb classes
                 // No pass 1 needed since scores are always <= 0 and exp() cannot overflow
-                let mut exp_sum = 0.0f64;
 
-                for chunk_index in 0..n_outer {
-                    // Build tmp_mu: trace minus contributions of MSB chunks
-                    // chunk_index encodes the byte values of chunks 1 to n_chunks-1
-                    // base is computed once per (chunk, i_chunk) pair, outside the j loop
-                    // This avoids recomputing chunk * SIZE_CHUNK * p + i_chunk * p
-                    // for every dimension j
-                    let mut tmp_mu = [0.0f64; 3];
-                    for j in 0..p {
-                        tmp_mu[j] = trace_raw[j];
-                        for chunk in 0..(n_chunks - 1) {
-                            let i_chunk = (chunk_index >> (chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1);
-                            let base = (chunk + 1) * SIZE_CHUNK * p + i_chunk * p;
-                            tmp_mu[j] -= mu_raw[base + j];
-                        }
-                    }
-
-                    // Inner loop: vary the LSB chunk over all possible byte values
-                    // score(c) = -0.5 * ||tmp_mu - mu_lsb||^2
-                    // lsb_offsets[i_lsb] replaces the multiplication i_lsb * p
-                    // with a precomputed table lookup
-                    for i_lsb in 0..n_lsb {
-                        let base = lsb_offsets[i_lsb];
-                        let mut sq = 0.0f64;
-                        for j in 0..p {
-                            let acc = tmp_mu[j] - mu_raw[base + j];
-                            sq += acc * acc;
-                        }
-                        // exp(score) where score = -0.5 * sq is always in (0, 1]
-                        // fast_exp gives ~4x speedup over f64::exp with ~4% error
-                        exp_sum += fast_exp(-0.5 * sq);
-                    }
-                }
+                assert_eq!(self.nb % n_chunks, 0);
+                let exp_sum = pass2(trace_raw, mu_chunks_t.view());
 
                 // Compute the score for the correct class directly from the label
                 // This is the numerator of the softmax
@@ -492,8 +480,7 @@ impl RLDA {
                         let mut mu_j = 0.0f64;
                         for chunk in 0..n_chunks {
                             let byte = ((label >> (chunk * NBITS_CHUNK)) & 0xFF) as usize;
-                            let base = chunk * SIZE_CHUNK * p + byte * p;
-                            mu_j += mu_raw[base + j];
+                            mu_j += mu_chunks_t[[chunk, j, byte]];
                         }
                         let diff = trace_raw[j] - mu_j;
                         sq += diff * diff;
@@ -598,6 +585,93 @@ impl RLDA {
         eprintln!("predict_proba:  {:.3?}", t1 - t0);
         return scores;
     }
+}
+
+// Need: n_chunk multiple of nb
+#[inline(never)]
+fn pass2(
+    // length: p
+    trace_raw: &[f64],
+    // shape: (n_chunks, p, chunk_size)
+    mu_chunks_t: ArrayView3<f64>,
+) -> f64 {
+    let p = trace_raw.len();
+    assert_eq!(p, mu_chunks_t.shape()[1]);
+    let n_chunks = mu_chunks_t.shape()[0];
+    assert_eq!(SIZE_CHUNK, mu_chunks_t.shape()[2]);
+
+    let mut exp_sum = 0.0f64;
+
+    let mut tmp_mu = vec![0.0f64; p];
+    for chunk_index in 0..(SIZE_CHUNK.pow((n_chunks - 1).try_into().unwrap())) {
+        tmp_mu.fill(0.0);
+        // Build tmp_mu: trace minus contributions of MSB chunks
+        // mu_chunks_t has shape (n_chunks, p, SIZE_CHUNK)
+        // mu_chunks_t[[chunk, dim, byte]] is the contribution of byte value
+        // to dimension dim of the projected mean for the given chunk
+        for j in 0..p {
+            tmp_mu[j] = trace_raw[j];
+            for (i_chunk, chunk) in mu_chunks_t
+                .slice(s![..n_chunks - 1, j, ..])
+                .outer_iter()
+                .enumerate()
+            {
+                tmp_mu[j] -= chunk[(chunk_index >> (i_chunk * NBITS_CHUNK)) & (SIZE_CHUNK - 1)];
+            }
+        }
+
+        // Hardcoded path for nb >= NBITS_CHUNK
+        // n_lsb = 256, always a multiple of 4
+        // Extract raw slice of LSB chunk for contiguous AVX2-ready access
+        // mu_chunks_t[[0, j, byte]] for fixed j gives 256 consecutive f64
+        let mu_lsb = mu_chunks_t.slice(s![n_chunks - 1, .., ..]);
+        let mu_lsb_raw = mu_lsb.as_slice().expect("mu_lsb must be contiguous");
+        let (mu_lsb_raw, rem) = mu_lsb_raw.as_chunks::<BLOCK_SIZE>();
+        assert!(rem.is_empty());
+        let (mu_lsb_raw, rem) = mu_lsb_raw.as_chunks::<{ SIZE_CHUNK / BLOCK_SIZE }>();
+        assert!(rem.is_empty());
+        assert_eq!(mu_lsb_raw.len(), p);
+
+        // Process 4 classes simultaneously
+        // sq0..sq3 are independent accumulators — no serial dependency
+        // mu_lsb_raw[j * SIZE_CHUNK + b .. b+4] are 4 consecutive f64
+        // enabling a single _mm256_loadu_pd load per dim per block
+        exp_sum += pass2_inner(&tmp_mu, mu_lsb_raw);
+        /*
+                    // Scalar fallback for nb < NBITS_CHUNK
+                    // n_lsb < 256, small number of classes, performance not critical
+                    for i_lsb in 0..n_lsb {
+                        let mut sq = 0.0f64;
+                        for j in 0..p {
+                            let acc = tmp_mu[j] - mu_chunks_t[[0, j, i_lsb]];
+                            sq += acc * acc;
+                        }
+                        *exp_sum += fast_exp(-0.5 * sq);
+                    }
+        */
+    }
+    return exp_sum;
+}
+
+#[inline(never)]
+fn pass2_inner(tmp_mu: &[f64], mu_lsb_raw: &[[[f64; BLOCK_SIZE]; SIZE_CHUNK / BLOCK_SIZE]]) -> f64 {
+    let mut exp_sum_blk = [0.0f64; BLOCK_SIZE];
+
+    for block in 0..(SIZE_CHUNK / BLOCK_SIZE) {
+        let sq: [f64; BLOCK_SIZE] =
+            tmp_mu
+                .iter()
+                .zip(mu_lsb_raw.iter())
+                .fold([0.0f64; BLOCK_SIZE], |acc, (l, mu)| {
+                    std::array::from_fn(|i| {
+                        let tmp = *l - mu[block][i];
+                        tmp.mul_add(tmp, acc[i])
+                    })
+                });
+        exp_sum_blk = std::array::from_fn(|i| exp_sum_blk[i] + fast_exp(-0.5 * sq[i]));
+    }
+    let tmp = exp_sum_blk.into_iter().sum::<f64>();
+    tmp
 }
 
 #[derive(Serialize, Deserialize)]
