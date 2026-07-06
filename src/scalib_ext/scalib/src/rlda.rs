@@ -80,6 +80,9 @@ pub struct RLDA {
     pub proj_coefs: Array3<f64>,
     /// Precomputed partial mus. Shape of (nv,n_chunks,size_chunk,p)
     pub mu_chunks: Array4<f64>,
+    // dans `pub struct RLDA { ... }`, après mu_chunks :
+    #[serde(skip)]
+    pub s_w: Array3<f64>,
 }
 
 /// Coefficient bit from a class. 0th bit is always 1, ith bit is i-1 th bit of c
@@ -149,6 +152,7 @@ impl RLDA {
             norm_proj: Array3::zeros((nv, p, ns)),
             proj_coefs: Array3::zeros((nv, p, nb + 1)),
             mu_chunks: Array4::zeros((nv, n_chunks, SIZE_CHUNK, p)),
+            s_w: Array3::zeros((nv, ns, ns)),
         }
     }
 
@@ -207,9 +211,11 @@ impl RLDA {
         mut norm_proj: ArrayViewMut2<f64>,
         mut proj_coefs: ArrayViewMut2<f64>,
         mut mu_chunks: ArrayViewMut3<f64>,
+        mut s_w_out: ArrayViewMut2<f64>,
         xtx: ArrayView2<f64>,
         xty: ArrayView2<f64>,
         scatter: ArrayView2<f64>,
+        s_w_override: Option<ArrayView2<f64>>,
         nb: usize,
         p: usize,
         n: usize,
@@ -259,13 +265,24 @@ impl RLDA {
         //     = s_t - xty^T*coef - coef.T*xty + s_m
         //     (s_t is self.scatter)
         let s_w = &scatter + s_m - &xty.t().dot(reg_coefs) - &reg_coefs.t().dot(&xty);
+        // Toujours exposer la s_w mesurée.
+        s_w_out.assign(&s_w);
+
+        // Mode override : on utilise la s_w fournie depuis Python telle quelle
+        // (même forme/échelle que get_s_w, i.e. une scatter = n * covariance).
+        // Sinon, comportement d'origine.
+        let s_w_eff: Array2<f64> = match s_w_override {
+            Some(m) => m.to_owned(),
+            None => s_w,
+        };
+
         let ns = norm_proj.shape()[1];
 
         let projection = if p == ns {
             Array2::eye(ns)
         } else {
-            let solver =
-                geigen::GEigenSolverP::new(&s_b.view(), &s_w.view(), p).expect("failed to solve");
+            let solver = geigen::GEigenSolverP::new(&s_b.view(), &s_w_eff.view(), p)
+                .expect("failed to solve");
             let projection = solver.vecs().t().into_owned();
             projection
         };
@@ -275,7 +292,7 @@ impl RLDA {
         // (we'd like it to be for later simplicity), hence a apply a rotation.
         // The new residual is projection*(trace-coefs^T*b), hence its scatter is
         // projection*s_w*projection^T
-        let cov_proj_res = projection.view().dot(&s_w).dot(&projection.t()) / (n as f64);
+        let cov_proj_res = projection.view().dot(&s_w_eff).dot(&projection.t()) / (n as f64);
         // We decompose cov_proj_res N as N = V*W*V^T where V is orthonormal and W diagonal
         // then if we re-project with W^-1/2*V^T, we get an identity covariance.
         let nalgebra::linalg::SymmetricEigen {
@@ -285,8 +302,7 @@ impl RLDA {
         let mut evals = eigenvalues.into_ndarray1();
         let evecs = eigenvectors.into_ndarray2();
         evals.mapv_inplace(|v| 1.0 / v.sqrt());
-        let normalizing_proj_t = evecs * evals.slice(s![.., NewAxis]);
-        // Storing projections and projected coefficients
+        let normalizing_proj_t = evecs * evals.slice(s![NewAxis, ..]);        // Storing projections and projected coefficients
         norm_proj.assign(&normalizing_proj_t.t().dot(&projection));
         proj_coefs.assign(&norm_proj.dot(&reg_coefs.t()));
 
@@ -312,33 +328,31 @@ impl RLDA {
         return Ok(());
     }
 
-    /// Generate projection, projected coefficients, and coefficient chunks
-    pub fn solve(&mut self) -> Result<(), ScalibError> {
-        let res = Zip::indexed(self.norm_proj.outer_iter_mut())
+    pub fn solve(&mut self, s_w_override: Option<ArrayView3<f64>>) -> Result<(), ScalibError> {
+        Zip::indexed(self.norm_proj.outer_iter_mut())
             .and(self.proj_coefs.outer_iter_mut())
             .and(self.mu_chunks.outer_iter_mut())
+            .and(self.s_w.outer_iter_mut())
             .into_par_iter()
             .try_for_each_init(
-                || return Array2::zeros((self.nb + 1, self.ns)),
-                |reg_coefs, (k, norm_proj, proj_coefs, mu_chunks)| {
+                || Array2::zeros((self.nb + 1, self.ns)),
+                |reg_coefs, (k, norm_proj, proj_coefs, mu_chunks, s_w_out)| {
                     RLDA::solve_variable(
                         reg_coefs,
                         norm_proj,
                         proj_coefs,
                         mu_chunks,
+                        s_w_out,
                         self.xtx.slice(s![k, .., ..]),
                         self.xty.slice(s![k, .., ..]),
                         self.scatter.view(),
+                        s_w_override.map(|m| m.slice_move(s![k, .., ..])),
                         self.nb,
                         self.p,
                         self.n,
                     )
                 },
-            );
-        match res {
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
-        }
+            )
     }
 
     /// Generate RLDAClusteredModel object that is used for information estimation

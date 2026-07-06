@@ -102,15 +102,33 @@ class RLDAClassifier:
 
         self._inner.update(traces, x.T, gemm_mode, get_config())
 
-    def solve(self):
+    def solve(self, s_w_override=None):
         """Solve the RLDA equations.
 
-        Notes
-        -----
-        Once this has been called, predictions can be performed.
+        Parameters
+        ----------
+        s_w_override : array_like, float64, optional
+            Modified within-class scatter to use instead of the estimated one,
+            shape ``(nv, ns, ns)`` (same form as :meth:`get_s_w`). If ``None``,
+            original behavior.
         """
-        self._inner.solve(get_config())
+        if s_w_override is not None:
+            s_w_override = np.ascontiguousarray(s_w_override, dtype=np.float64)
+            assert s_w_override.shape == (
+                self._nv,
+                self._ns,
+                self._ns,
+            ), f"s_w_override must have shape {(self._nv, self._ns, self._ns)}"
+        self._inner.solve(get_config(), s_w_override)
         self._solved = True
+
+    def get_s_w(self) -> npt.NDArray[np.float64]:
+        """Within-class scatter per variable. Shape ``(nv, ns, ns)``."""
+        return self._inner.get_s_w()
+
+    def get_n(self) -> int:
+        """Total number of profiling traces accumulated."""
+        return self._inner.get_n()
 
     def get_proj(self) -> npt.NDArray[np.float64]:
         """Returns the projection matrix.

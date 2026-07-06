@@ -3,7 +3,8 @@
 use crate::ScalibError;
 use bincode::{deserialize, serialize};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, ToPyArray,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, ToPyArray,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
@@ -27,7 +28,13 @@ impl RLDA {
             Ok(Self { inner })
         }
     }
+    fn get_s_w<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f64>>> {
+        Ok(self.inner.as_ref().unwrap().s_w.to_pyarray(py))
+    }
 
+    fn get_n(&self) -> usize {
+        self.inner.as_ref().unwrap().n
+    }
     pub fn __setstate__(&mut self, state: &Bound<PyBytes>) {
         self.inner = deserialize(state.as_bytes()).unwrap();
     }
@@ -53,12 +60,18 @@ impl RLDA {
         config.on_worker(py, |_| self.inner.as_mut().unwrap().update(x, y, gemm_algo));
     }
 
-    fn solve<'py>(&mut self, py: Python<'py>, config: crate::ConfigWrapper) -> PyResult<()> {
+    #[pyo3(signature = (config, s_w_override=None))]
+    fn solve<'py>(
+        &mut self,
+        py: Python<'py>,
+        config: crate::ConfigWrapper,
+        s_w_override: Option<PyReadonlyArray3<f64>>,
+    ) -> PyResult<()> {
+        let sw = s_w_override.as_ref().map(|a| a.as_array());
         config
-            .on_worker(py, |_| self.inner.as_mut().unwrap().solve())
+            .on_worker(py, |_| self.inner.as_mut().unwrap().solve(sw))
             .map_err(|e| ScalibError::from_scalib(e, py))
     }
-
     fn get_info(
         &self,
         py: Python,
